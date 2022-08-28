@@ -32,6 +32,13 @@ import (
 	"6.824/labrpc"
 )
 
+func min(a, b int) int {
+	if a < b {
+			return a
+	}
+	return b
+}
+
 type logTopic string
 const (
 	dError   logTopic = "ERRO"
@@ -42,6 +49,7 @@ const (
 	dVote    logTopic = "VOTE"
 	dWarn    logTopic = "WARN"
 	dRoleChange logTopic = "ROLE"
+	dLog logTopic = "LOG1"
 )
 
 // Retrieve the verbosity level from an environment variable
@@ -121,10 +129,21 @@ const (
 	FOLLOWER role = "FOLLOWER"
 )
 
+// Lab 2B:
+// Implement Start()
+// Add log entries in AppendEntries
+// TODO: Send each newly committed entry on applyCh on each peer.
+
+type LogEntry struct {
+	Term int
+	Command interface{}
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
 type Raft struct {
+	n int
 	mu        sync.Mutex          // Lock to protect shared access to this peer's state
 	peers     []*labrpc.ClientEnd // RPC end points of all peers
 	persister *Persister          // Object to hold this peer's persisted state
@@ -134,9 +153,17 @@ type Raft struct {
 	currentTerm int
 	votedFor int
 	role role
-
 	lastHeartbeatOrElection time.Time
 
+	logEntries []LogEntry
+	commitIndex int
+	lastApplied int
+
+	nextIndex []int
+	matchIndex []int
+	// last log index. len(logEntries) might not be accurate.
+	lastIndex int
+	applyCh chan ApplyMsg
 
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
@@ -220,7 +247,12 @@ func (r *Raft) Snapshot(index int, snapshot []byte) {
 type AppendEntriesArgs struct {
 	Term int
 	LeaderID int
-	Entries []interface{}
+
+	LogEntries []LogEntry
+	PrevLogIndex int
+	PrevLogTerm int
+	// leader's commitIndex
+	LeaderCommitIndex int
 }
 
 type AppendEntriesReply struct {
@@ -228,14 +260,27 @@ type AppendEntriesReply struct {
 	Success bool
 }
 
+// Caller must hold the lock.
+func (r *Raft) addEntry(entry LogEntry) {
+	ind := r.lastIndex + 1
+	if len(r.logEntries) <= ind {
+		r.logEntries = append(r.logEntries, entry)
+	} else {
+		r.logEntries[ind] = entry
+	}
+	r.lastIndex++
+}
+
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	PrettyLog(dTimer, r.me, "at T%d received heartbeat from S%d at T%d", r.currentTerm, args.LeaderID, args.Term)
+	PrettyLog(dTimer, r.me, "at T%d received heartbeat (S%d, %v, T%d)", r.currentTerm, args.LeaderID, args.LogEntries, args.Term)
+	// Potentially reset the heartbeat timer but it should be ok.
+	r.lastHeartbeatOrElection = time.Now()
 
 	reply.Term = r.currentTerm
 
-	if args.Term < r.currentTerm {
+	if (args.Term < r.currentTerm || r.lastIndex < args.PrevLogIndex || r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
 		return
 	}
@@ -243,42 +288,144 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	if args.Term > r.currentTerm || (args.Term == r.currentTerm && r.role == CANDIDATE) {
 		PrettyLog(dInfo, r.me, "Got term (%d >= %d), %v converting to follower", args.Term, r.currentTerm, r.role)
 		r.convertToFollower(args.Term)
-		return
 	}
-	r.lastHeartbeatOrElection = time.Now()
+	// copy leader's entries to the log.
+	for i := 1; i <= len(args.LogEntries); i++ {
+		ind := args.PrevLogIndex + i
+		if len(r.logEntries) <= ind {
+			r.logEntries = append(r.logEntries, args.LogEntries[i - 1])
+		} else {
+			r.logEntries[ind] = args.LogEntries[i - 1]
+		}
+	}
+	r.lastIndex = args.PrevLogIndex + len(args.LogEntries)
+	if args.LeaderCommitIndex > r.commitIndex {
+		// is it possible that leaderCommit is larger than r.lastIndex??
+		r.commitIndex = min(args.LeaderCommitIndex, r.lastIndex)
+
+		if r.commitIndex > r.lastApplied {
+			PrettyLog(dLog, r.me, "committed > applied (%d>%d), sending ApplyMsgs", r.commitIndex, r.lastApplied)
+			r.sendApplyMessages()
+		}
+	}
 }
 
+func (r *Raft) sendAppendEntries(server int, req *AppendEntriesArgs) {
+	resp := AppendEntriesReply{}
+	ok := r.peers[server].Call("Raft.AppendEntries", req, &resp)
+	// When does this happen?
+	if !ok {
+		return
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if resp.Term > r.currentTerm {
+		PrettyLog(dRoleChange, r.me, "Got higher term (%d > %d) from heartbeat responses, converting to follower", resp.Term, r.currentTerm)
+		r.convertToFollower(resp.Term)
+		return
+	}
+	// Unsuccessful because of log inconsistency
+	if !resp.Success {
+		r.nextIndex[server]--
+		return
+	}
+	// TODO: Add a check that checks the req contains actual logs.
+	// Entries applied successfully by peer.
+	r.matchIndex[server] = req.PrevLogIndex + len(req.LogEntries)
+	r.nextIndex[server] = r.matchIndex[server] + 1
+	PrettyLog(dLog, r.me, "updating S%d matchInd: %d, nextInd: %d on success", server, r.matchIndex[server], r.nextIndex[server])
+
+	// Try to commit entries.
+	for i := r.lastIndex; i > r.commitIndex; i-- {
+		count := 1
+		for k := 0; k < r.n; k++ {
+			if k == r.me {
+				continue
+			}
+			PrettyLog(dLeader, r.me, "log ind %d, server %d, matchInd %d", i, k, r.matchIndex[k])
+			if r.matchIndex[k] >= i {
+				count++
+				if count > r.n / 2 {
+					r.commitIndex = i
+					goto FINISH
+				}
+			}
+		}
+	}
+FINISH:
+	if r.commitIndex > r.lastApplied {
+		PrettyLog(dLog, r.me, "committed > applied (%d>%d), sending ApplyMsgs", r.commitIndex, r.lastApplied)
+		r.sendApplyMessages()
+	}
+}
+
+// Caller must hold the r.mu lock.
+func (r *Raft) sendApplyMessages() {
+	for i := r.lastApplied + 1; i <= r.commitIndex; i++ {
+		applyMsg := ApplyMsg{
+			CommandValid: true,
+			Command: r.logEntries[i].Command,
+			CommandIndex: i,
+		}
+		r.applyCh <- applyMsg
+	}
+	r.lastApplied = r.commitIndex
+}
+
+// TODO: complete the logic on leader's side sending heartbeats.
 // This function should return fast.
 func (r *Raft) broadcastHeartbeat() {
+	// r.mu.Lock()
+	// if r.role != LEADER {
+	// 	 r.mu.Unlock()
+	// 	 return
+	// }
+	// req := &AppendEntriesArgs{
+	// 	Term: r.currentTerm,
+	// 	LeaderID: r.me,
+	// 	Entries: nil,
+	// }
+	// curTerm := r.currentTerm
+	// r.mu.Unlock()
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.role != LEADER {
-		 r.mu.Unlock()
-		 return
+		return
 	}
-	req := &AppendEntriesArgs{
-		Term: r.currentTerm,
-		LeaderID: r.me,
-		Entries: nil,
-	}
-	curTerm := r.currentTerm
-	r.mu.Unlock()
 	for i := range r.peers {
 		i := i
 		if i == r.me {
 			continue
 		}
-		resp := &AppendEntriesReply{}
-		go func() {
-			PrettyLog(dLeader, r.me, "Leader sending heartbeat to S%d at T%d", i, curTerm)
-			r.sendAppendEntries(i, req, resp)
+		var logsToSend []LogEntry
+		PrettyLog(dLog, r.me, "preparing log entries nextInd[%d]: %d, lastInd: %d", i, r.nextIndex[i], r.lastIndex)
+		if r.nextIndex[i] <= r.lastIndex {
+			// copy(logsToSend, r.logEntries[r.nextIndex[i]:r.lastIndex + 1])
+			logsToSend = append(logsToSend, r.logEntries[r.nextIndex[i] : r.lastIndex + 1]...)
+			PrettyLog(dLog, r.me, "logsToSend: %v", logsToSend)
+		}
+		req := AppendEntriesArgs{
+			Term:	r.currentTerm,
+			LeaderID: r.me,
+			PrevLogIndex: r.nextIndex[i] - 1,
+			PrevLogTerm: r.logEntries[r.nextIndex[i] - 1].Term,
+			LeaderCommitIndex: r.commitIndex,
+			LogEntries: logsToSend,
+		}
+		PrettyLog(dLeader, r.me, "Leader sending heartbeat to S%d at T%d", i, r.currentTerm)
+		go r.sendAppendEntries(i, &req)
+		// go func() {
+		// 	PrettyLog(dLeader, r.me, "Leader sending heartbeat to S%d at T%d", i, curTerm)
+		// 	r.sendAppendEntries(i, req, resp)
 
-			r.mu.Lock()
-			if resp.Term > r.currentTerm {
-				PrettyLog(dRoleChange, r.me, "Got higher term (%d > %d) from heartbeat responses, converting to follower", resp.Term, r.currentTerm)
-				r.convertToFollower(resp.Term)
-			}
-			r.mu.Unlock()
-		}()
+		// 	r.mu.Lock()
+		// 	if resp.Term > r.currentTerm {
+		// 		PrettyLog(dRoleChange, r.me, "Got higher term (%d > %d) from heartbeat responses, converting to follower", resp.Term, r.currentTerm)
+		// 		r.convertToFollower(resp.Term)
+		// 	}
+		// 	r.mu.Unlock()
+		// }()
 	}
 }
 
@@ -286,6 +433,10 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	Term int
 	CandidateID int
+
+	// For election restriction.
+	LastIndex int
+	LastTerm int
 }
 
 type RequestVoteReply struct {
@@ -298,7 +449,7 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	PrettyLog(dVote, r.me, "Got vote request from S%d at T%d", args.CandidateID, r.currentTerm)
+	PrettyLog(dVote, r.me, "Got vote request: (S%d I%d T%d) at T%d", args.CandidateID, args.LastIndex, args.LastTerm, r.currentTerm)
 
 	reply.Term = r.currentTerm
 
@@ -309,7 +460,9 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		PrettyLog(dVote, r.me, "Candidate term is higher, updating (%d > %d) and converting %v to follower", args.Term, r.currentTerm, r.role)
 		r.convertToFollower(args.Term)
 	}
-	if r.role == FOLLOWER && (r.votedFor == -1 || r.votedFor == args.CandidateID) {	// Not sure why r.votedFor == args.CandidateID is needed.
+	curLastTerm := r.logEntries[r.lastIndex].Term
+	// Election restriction.
+	if r.role == FOLLOWER && (r.votedFor == -1 || r.votedFor == args.CandidateID) && (args.LastTerm > curLastTerm || (args.LastTerm == curLastTerm && args.LastIndex >= r.lastIndex)) {	// Not sure why r.votedFor == args.CandidateID is needed.
 		PrettyLog(dVote, r.me, "granted vote to S%d at T%d", args.CandidateID, r.currentTerm)
 		reply.VoteGranted = true
 		r.votedFor = args.CandidateID
@@ -317,10 +470,10 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	ok := r.peers[server].Call("Raft.AppendEntries", args, reply)
-	return ok
-}
+// func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+// 	ok := r.peers[server].Call("Raft.AppendEntries", args, reply)
+// 	return ok
+// }
 
 //
 // example code to send a RequestVote RPC to a server.
@@ -372,13 +525,17 @@ func (r *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Request
 // the leader.
 //
 func (r *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if r.role != LEADER {
+		return -1, -1, false
+	}
+	PrettyLog(dLeader, r.me, "got cmd(%v) as %v", command, r.role)
+	r.addEntry(LogEntry{Term: r.currentTerm, Command: command})
+	index := r.lastIndex
+	term := r.currentTerm
 	isLeader := true
-
-	// Your code here (2B).
-
-
 	return index, term, isLeader
 }
 
@@ -403,6 +560,7 @@ func (r *Raft) killed() bool {
 	return z == 1
 }
 
+// This method doesn't return fast.
 func (r *Raft) startElection() {
 	r.mu.Lock()
 
@@ -414,6 +572,8 @@ func (r *Raft) startElection() {
 	req := &RequestVoteArgs{
 		Term: r.currentTerm,
 		CandidateID: r.me,
+		LastIndex: r.lastIndex,
+		LastTerm: r.logEntries[r.lastIndex].Term,
 	}
 	curTerm := r.currentTerm
 	r.mu.Unlock()
@@ -460,11 +620,20 @@ func (r *Raft) startElection() {
 		r.mu.Lock()
 		if r.currentTerm == curTerm && r.role == CANDIDATE {
 			PrettyLog(dVote, r.me, "Candidate got %d votes at T%d, becoming leader", votes, r.currentTerm)
-			r.role = LEADER
+			// r.role = LEADER
+			r.convertToLeader()
 		}
 		r.mu.Unlock()
 	}
 	voteMu.Unlock()
+}
+
+func (r *Raft) convertToLeader() {
+	r.role = LEADER
+	for i := 0; i < r.n; i++ {
+		r.nextIndex[i] = r.lastIndex + 1
+		r.matchIndex[i] = 0
+	}
 }
 
 // Caller must hold r.mu.
@@ -489,6 +658,8 @@ func (r *Raft) ticker() {
 			PrettyLog(dTimer, r.me, "%v election timeout, starting election", r.role)
 			go r.startElection()
 			electionTimeout = randomElectionTimeout()
+			// Reset the election timer when starting an election.
+			r.lastHeartbeatOrElection = time.Now()
 		}
 		r.mu.Unlock()
 		time.Sleep(20 * time.Millisecond)
@@ -522,6 +693,7 @@ func (r *Raft) leader() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	r := &Raft{}
+	r.n = len(peers)
 	r.peers = peers
 	r.persister = persister
 	r.me = me
@@ -531,6 +703,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.votedFor = -1
 	r.role = FOLLOWER
 	r.lastHeartbeatOrElection = time.Now()
+
+	// Add a dummy log so that log index starts at 1.
+	r.logEntries = append(r.logEntries, LogEntry{Term: 0})
+	r.commitIndex = 0
+	r.lastApplied = 0
+	r.nextIndex = make([]int, r.n)
+	r.matchIndex = make([]int, r.n)
+	r.lastIndex = 0
+	r.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	r.readPersist(persister.ReadRaftState())
