@@ -258,6 +258,12 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term int
 	Success bool
+	// Term in the conflict entry. -1 if none.
+	XTerm int
+	// Index of the first entry with that term. -1 if none.
+	XIndex int
+	// Follower's log length.
+	XLen int
 }
 
 // Caller must hold the lock.
@@ -282,6 +288,17 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 
 	if (args.Term < r.currentTerm || r.lastIndex < args.PrevLogIndex || r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm) {
 		reply.Success = false
+		reply.XTerm = -1
+		reply.XIndex = -1
+		reply.XLen = r.lastIndex
+		if r.lastIndex >= args.PrevLogIndex && r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm {
+			reply.XTerm = r.logEntries[args.PrevLogIndex].Term
+			ind := args.PrevLogIndex
+			for ind > 1 && r.logEntries[ind - 1].Term == reply.XTerm {
+				ind--
+			}
+			reply.XIndex = ind
+		}
 		return
 	}
 	reply.Success = true
@@ -327,7 +344,21 @@ func (r *Raft) sendAppendEntries(server int, req *AppendEntriesArgs) {
 	}
 	// Unsuccessful because of log inconsistency
 	if !resp.Success {
-		r.nextIndex[server]--
+		// r.nextIndex[server]--
+		// Follower's log is too short
+		if resp.XTerm == -1 {
+			r.nextIndex[server] = resp.XLen + 1
+		} else {
+			// If Leader doesn't have XTerm
+			r.nextIndex[server] = resp.XIndex
+			// Try find the last log entry for XTerm.
+			for i := r.nextIndex[server] - 1; i > 1; i-- {
+				if r.logEntries[i - 1].Term == resp.XTerm {
+					r.nextIndex[server] = i
+					break
+				}
+			}
+		}
 		return
 	}
 	// TODO: Add a check that checks the req contains actual logs.
@@ -373,7 +404,6 @@ func (r *Raft) sendApplyMessages() {
 	r.lastApplied = r.commitIndex
 }
 
-// TODO: complete the logic on leader's side sending heartbeats.
 // This function should return fast.
 func (r *Raft) broadcastHeartbeat() {
 	// r.mu.Lock()
