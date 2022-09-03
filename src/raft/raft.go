@@ -282,7 +282,10 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	defer r.mu.Unlock()
 	PrettyLog(dTimer, r.me, "at T%d received heartbeat (S%d, %v, T%d)", r.currentTerm, args.LeaderID, args.LogEntries, args.Term)
 	// Potentially reset the heartbeat timer but it should be ok.
-	r.lastHeartbeatOrElection = time.Now()
+	// Only reset the timer for current leader.
+	if args.Term >= r.currentTerm {
+		r.lastHeartbeatOrElection = time.Now()
+	}
 
 	reply.Term = r.currentTerm
 
@@ -305,6 +308,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	if args.Term > r.currentTerm || (args.Term == r.currentTerm && r.role == CANDIDATE) {
 		PrettyLog(dInfo, r.me, "Got term (%d >= %d), %v converting to follower", args.Term, r.currentTerm, r.role)
 		r.convertToFollower(args.Term)
+		r.lastHeartbeatOrElection = time.Now()
 	}
 	// copy leader's entries to the log.
 	for i := 1; i <= len(args.LogEntries); i++ {
@@ -340,6 +344,7 @@ func (r *Raft) sendAppendEntries(server int, req *AppendEntriesArgs) {
 	if resp.Term > r.currentTerm {
 		PrettyLog(dRoleChange, r.me, "Got higher term (%d > %d) from heartbeat responses, converting to follower", resp.Term, r.currentTerm)
 		r.convertToFollower(resp.Term)
+		r.lastHeartbeatOrElection = time.Now()
 		return
 	}
 	// Unsuccessful because of log inconsistency
@@ -559,6 +564,7 @@ func (r *Raft) Start(command interface{}) (int, int, bool) {
 	defer r.mu.Unlock()
 
 	if r.role != LEADER {
+		PrettyLog(dLog, r.me, "got cmd(%v) as %v", command, r.role)
 		return -1, -1, false
 	}
 	PrettyLog(dLeader, r.me, "got cmd(%v) as %v", command, r.role)
@@ -671,7 +677,6 @@ func (r *Raft) convertToFollower(term int) {
 	r.currentTerm = term
 	r.role = FOLLOWER
 	r.votedFor = -1
-	r.lastHeartbeatOrElection = time.Now()
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
