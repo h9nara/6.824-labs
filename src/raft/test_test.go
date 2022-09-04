@@ -8,12 +8,14 @@ package raft
 // test with the original before submitting.
 //
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).
@@ -267,6 +269,15 @@ func For2023TestLeaderFailure2B(t *testing.T) {
 		t.Fatalf("%v committed but no majority", n)
 	}
 
+	cfg.end()
+}
+
+func TestAgreement(t *testing.T) {
+	servers := 3
+	cfg := make_config(t, servers, false, false)
+	defer cfg.cleanup()
+	cfg.begin("Test basic agreement")
+	cfg.one(99, servers, false)
 	cfg.end()
 }
 

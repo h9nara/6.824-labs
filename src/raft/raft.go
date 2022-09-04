@@ -597,8 +597,13 @@ func (r *Raft) killed() bool {
 }
 
 // This method doesn't return fast.
-func (r *Raft) startElection() {
+func (r *Raft) startElection(fromRole role, fromTerm int) {
 	r.mu.Lock()
+
+	if r.role != fromRole || r.currentTerm != fromTerm {
+		r.mu.Unlock()
+		return
+	}
 
 	// Update relevant states.
 	r.currentTerm++
@@ -691,7 +696,7 @@ func (r *Raft) ticker() {
 		r.mu.Lock()
 		if time.Since(r.lastHeartbeatOrElection) > electionTimeout && (r.role == FOLLOWER || r.role == CANDIDATE){
 			PrettyLog(dTimer, r.me, "%v election timeout, starting election", r.role)
-			go r.startElection()
+			go r.startElection(r.role, r.currentTerm)
 			electionTimeout = randomElectionTimeout()
 			// Reset the election timer when starting an election.
 			r.lastHeartbeatOrElection = time.Now()
