@@ -19,6 +19,7 @@ package raft
 
 import (
 	//	"bytes"
+	"bytes"
 	"fmt"
 	"log"
 	"math/rand"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	//	"6.824/labgob"
+	"6.824/labgob"
 	"6.824/labrpc"
 )
 
@@ -129,11 +131,6 @@ const (
 	FOLLOWER role = "FOLLOWER"
 )
 
-// Lab 2B:
-// Implement Start()
-// Add log entries in AppendEntries
-// TODO: Send each newly committed entry on applyCh on each peer.
-
 type LogEntry struct {
 	Term int
 	Command interface{}
@@ -192,12 +189,13 @@ func (r *Raft) GetState() (int, bool) {
 func (r *Raft) persist() {
 	// Your code here (2C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if e.Encode(r.currentTerm) != nil || e.Encode(r.votedFor) != nil || e.Encode(r.logEntries) != nil {
+		panic("failed to encode raft persistent state")
+	}
+	data := w.Bytes()
+	r.persister.SaveRaftState(data)
 }
 
 
@@ -210,17 +208,18 @@ func (r *Raft) readPersist(data []byte) {
 	}
 	// Your code here (2C).
 	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	b := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(b)
+	var currentTerm int
+	var votedFor int
+	var logs []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&logs) != nil {
+		panic("failed to decode persisted state")
+	}
+	r.currentTerm = currentTerm
+	r.votedFor = votedFor
+	r.logEntries = logs
+	PrettyLog(dLog, r.me, "restored persisted state term: %d, votedFor: %d, logs: %v", currentTerm, votedFor, r.logEntries)
 }
 
 
@@ -275,12 +274,13 @@ func (r *Raft) addEntry(entry LogEntry) {
 		r.logEntries[ind] = entry
 	}
 	r.lastIndex++
+	r.persist()
 }
 
 func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	PrettyLog(dTimer, r.me, "at T%d received heartbeat (S%d, %v, T%d)", r.currentTerm, args.LeaderID, args.LogEntries, args.Term)
+	PrettyLog(dTimer, r.me, "at T%d received heartbeat (S%d, [%d,%d], T%d)", r.currentTerm, args.LeaderID, args.PrevLogIndex + 1, args.PrevLogIndex + len(args.LogEntries), args.Term)
 	// Potentially reset the heartbeat timer but it should be ok.
 	// Only reset the timer for current leader.
 	if args.Term >= r.currentTerm {
@@ -290,6 +290,10 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	reply.Term = r.currentTerm
 
 	if (args.Term < r.currentTerm || r.lastIndex < args.PrevLogIndex || r.logEntries[args.PrevLogIndex].Term != args.PrevLogTerm) {
+		PrettyLog(dTimer, r.me, "at T%d w/ lastInd %d unsuc got S%d T%d PLI %d", r.currentTerm, r.lastIndex, args.LeaderID, args.Term, args.PrevLogIndex)
+		if args.Term >= r.currentTerm && r.lastIndex >= args.PrevLogIndex {
+			PrettyLog(dTimer, r.me, " T%d at I%d != T%d", r.logEntries[args.PrevLogIndex].Term, args.PrevLogIndex, args.PrevLogTerm)
+		}
 		reply.Success = false
 		reply.XTerm = -1
 		reply.XIndex = -1
@@ -301,6 +305,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 				ind--
 			}
 			reply.XIndex = ind
+			PrettyLog(dTimer, r.me, "setting XTerm %d XInd %d", reply.XTerm, reply.XIndex)
 		}
 		return
 	}
@@ -308,18 +313,23 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 	if args.Term > r.currentTerm || (args.Term == r.currentTerm && r.role == CANDIDATE) {
 		PrettyLog(dInfo, r.me, "Got term (%d >= %d), %v converting to follower", args.Term, r.currentTerm, r.role)
 		r.convertToFollower(args.Term)
-		r.lastHeartbeatOrElection = time.Now()
 	}
+	truncated := false
 	// copy leader's entries to the log.
 	for i := 1; i <= len(args.LogEntries); i++ {
 		ind := args.PrevLogIndex + i
 		if len(r.logEntries) <= ind {
 			r.logEntries = append(r.logEntries, args.LogEntries[i - 1])
-		} else {
-			r.logEntries[ind] = args.LogEntries[i - 1]
+			continue
 		}
+		if ind <= r.lastIndex && r.logEntries[ind].Term != args.LogEntries[i - 1].Term {
+			truncated = true
+		}
+		r.logEntries[ind] = args.LogEntries[i - 1]
 	}
-	r.lastIndex = args.PrevLogIndex + len(args.LogEntries)
+	if r.lastIndex < args.PrevLogIndex + len(args.LogEntries) || truncated {
+		r.lastIndex = args.PrevLogIndex + len(args.LogEntries)
+	}
 	if args.LeaderCommitIndex > r.commitIndex {
 		// is it possible that leaderCommit is larger than r.lastIndex??
 		r.commitIndex = min(args.LeaderCommitIndex, r.lastIndex)
@@ -329,6 +339,7 @@ func (r *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply)
 			r.sendApplyMessages()
 		}
 	}
+	r.persist()
 }
 
 func (r *Raft) sendAppendEntries(server int, req *AppendEntriesArgs) {
@@ -341,39 +352,64 @@ func (r *Raft) sendAppendEntries(server int, req *AppendEntriesArgs) {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	// The role or term might has been changed since sending the AppendEntries
+	// request. This typically happens in an unreliable network. Verify critical state
+	// before proceed.
+	if r.role != LEADER || req.Term != r.currentTerm {
+		return
+	}
+
 	if resp.Term > r.currentTerm {
 		PrettyLog(dRoleChange, r.me, "Got higher term (%d > %d) from heartbeat responses, converting to follower", resp.Term, r.currentTerm)
 		r.convertToFollower(resp.Term)
 		r.lastHeartbeatOrElection = time.Now()
+		r.persist()
 		return
 	}
 	// Unsuccessful because of log inconsistency
 	if !resp.Success {
 		// r.nextIndex[server]--
+		var nextInd int
 		// Follower's log is too short
 		if resp.XTerm == -1 {
-			r.nextIndex[server] = resp.XLen + 1
+			nextInd = resp.XLen + 1
+			PrettyLog(dLeader, r.me, "set nextInd for S%d to %d coz log too short", server, nextInd)
 		} else {
 			// If Leader doesn't have XTerm
-			r.nextIndex[server] = resp.XIndex
+			nextInd = resp.XIndex
+			PrettyLog(dLeader, r.me, "set nextInd for S%d to %d in case ld doesn't hav T%d", server, nextInd, resp.XTerm)
 			// Try find the last log entry for XTerm.
-			for i := r.nextIndex[server] - 1; i > 1; i-- {
+			for i := nextInd - 1; i > 1; i-- {
 				if r.logEntries[i - 1].Term == resp.XTerm {
-					r.nextIndex[server] = i
+					nextInd = i
+					PrettyLog(dLeader, r.me, "updating nextInd for S%d to %d last entry of T%d", server, nextInd, resp.XTerm)
 					break
 				}
 			}
 		}
+		if nextInd < r.nextIndex[server] {
+			PrettyLog(dLeader, r.me, "updating nextInd[%d] to %d<%d", server, nextInd, r.nextIndex[server]);
+			r.nextIndex[server] = nextInd
+			return
+		}
+		PrettyLog(dLeader, r.me, "not updating nextInd[%d] coz %d>=%d", server, nextInd, r.nextIndex[server]);
 		return
 	}
-	// TODO: Add a check that checks the req contains actual logs.
-	// Entries applied successfully by peer.
-	r.matchIndex[server] = req.PrevLogIndex + len(req.LogEntries)
-	r.nextIndex[server] = r.matchIndex[server] + 1
+
+	matchedInd := req.PrevLogIndex + len(req.LogEntries)
+	// check matchIndex regression in case of stale rpc response.
+	if matchedInd > r.matchIndex[server] {
+		r.matchIndex[server] = matchedInd
+		r.nextIndex[server] = r.matchIndex[server] + 1
+	}
 	PrettyLog(dLog, r.me, "updating S%d matchInd: %d, nextInd: %d on success", server, r.matchIndex[server], r.nextIndex[server])
 
 	// Try to commit entries.
 	for i := r.lastIndex; i > r.commitIndex; i-- {
+		if r.logEntries[i].Term != r.currentTerm {
+			break
+		}
 		count := 1
 		for k := 0; k < r.n; k++ {
 			if k == r.me {
@@ -411,18 +447,6 @@ func (r *Raft) sendApplyMessages() {
 
 // This function should return fast.
 func (r *Raft) broadcastHeartbeat() {
-	// r.mu.Lock()
-	// if r.role != LEADER {
-	// 	 r.mu.Unlock()
-	// 	 return
-	// }
-	// req := &AppendEntriesArgs{
-	// 	Term: r.currentTerm,
-	// 	LeaderID: r.me,
-	// 	Entries: nil,
-	// }
-	// curTerm := r.currentTerm
-	// r.mu.Unlock()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.role != LEADER {
@@ -436,9 +460,8 @@ func (r *Raft) broadcastHeartbeat() {
 		var logsToSend []LogEntry
 		PrettyLog(dLog, r.me, "preparing log entries nextInd[%d]: %d, lastInd: %d", i, r.nextIndex[i], r.lastIndex)
 		if r.nextIndex[i] <= r.lastIndex {
-			// copy(logsToSend, r.logEntries[r.nextIndex[i]:r.lastIndex + 1])
 			logsToSend = append(logsToSend, r.logEntries[r.nextIndex[i] : r.lastIndex + 1]...)
-			PrettyLog(dLog, r.me, "logsToSend: %v", logsToSend)
+			PrettyLog(dLog, r.me, "logsToSend: [%d,%d], len(r.logs): %v, r.lastInd: %d", r.nextIndex[i], r.lastIndex, len(r.logEntries), r.lastIndex)
 		}
 		req := AppendEntriesArgs{
 			Term:	r.currentTerm,
@@ -450,17 +473,6 @@ func (r *Raft) broadcastHeartbeat() {
 		}
 		PrettyLog(dLeader, r.me, "Leader sending heartbeat to S%d at T%d", i, r.currentTerm)
 		go r.sendAppendEntries(i, &req)
-		// go func() {
-		// 	PrettyLog(dLeader, r.me, "Leader sending heartbeat to S%d at T%d", i, curTerm)
-		// 	r.sendAppendEntries(i, req, resp)
-
-		// 	r.mu.Lock()
-		// 	if resp.Term > r.currentTerm {
-		// 		PrettyLog(dRoleChange, r.me, "Got higher term (%d > %d) from heartbeat responses, converting to follower", resp.Term, r.currentTerm)
-		// 		r.convertToFollower(resp.Term)
-		// 	}
-		// 	r.mu.Unlock()
-		// }()
 	}
 }
 
@@ -484,7 +496,7 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	PrettyLog(dVote, r.me, "Got vote request: (S%d I%d T%d) at T%d", args.CandidateID, args.LastIndex, args.LastTerm, r.currentTerm)
+	PrettyLog(dVote, r.me, "Got vote request: (S%d T%d I%d T%d) at T%d", args.CandidateID, args.Term, args.LastIndex, args.LastTerm, r.currentTerm)
 
 	reply.Term = r.currentTerm
 
@@ -503,6 +515,7 @@ func (r *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		r.votedFor = args.CandidateID
 		r.lastHeartbeatOrElection = time.Now()
 	}
+	r.persist()
 }
 
 // func (r *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -564,11 +577,11 @@ func (r *Raft) Start(command interface{}) (int, int, bool) {
 	defer r.mu.Unlock()
 
 	if r.role != LEADER {
-		PrettyLog(dLog, r.me, "got cmd(%v) as %v", command, r.role)
+		PrettyLog(dLog, r.me, "got cmd(%v) as %v at T%d, I%d", command, r.role, r.currentTerm, r.lastIndex)
 		return -1, -1, false
 	}
-	PrettyLog(dLeader, r.me, "got cmd(%v) as %v", command, r.role)
 	r.addEntry(LogEntry{Term: r.currentTerm, Command: command})
+	PrettyLog(dLeader, r.me, "got cmd(%v) as %v at T%d, I%d", command, r.role, r.currentTerm, r.lastIndex)
 	index := r.lastIndex
 	term := r.currentTerm
 	isLeader := true
@@ -609,6 +622,7 @@ func (r *Raft) startElection(fromRole role, fromTerm int) {
 	r.currentTerm++
 	r.role = CANDIDATE
 	r.votedFor = r.me
+	r.persist()
 
 	req := &RequestVoteArgs{
 		Term: r.currentTerm,
@@ -639,6 +653,7 @@ func (r *Raft) startElection(fromRole role, fromTerm int) {
 			if resp.Term > r.currentTerm {
 				PrettyLog(dRoleChange, r.me, "%v got higher term(%d > %d) from S%d, converting to follower", r.role, resp.Term, r.currentTerm, i)
 				r.convertToFollower(resp.Term)
+				r.persist()
 			}
 			r.mu.Unlock()
 
@@ -661,7 +676,6 @@ func (r *Raft) startElection(fromRole role, fromTerm int) {
 		r.mu.Lock()
 		if r.currentTerm == curTerm && r.role == CANDIDATE {
 			PrettyLog(dVote, r.me, "Candidate got %d votes at T%d, becoming leader", votes, r.currentTerm)
-			// r.role = LEADER
 			r.convertToLeader()
 		}
 		r.mu.Unlock()
@@ -750,11 +764,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	r.lastApplied = 0
 	r.nextIndex = make([]int, r.n)
 	r.matchIndex = make([]int, r.n)
-	r.lastIndex = 0
 	r.applyCh = applyCh
 
 	// initialize from state persisted before a crash
 	r.readPersist(persister.ReadRaftState())
+	r.lastIndex = len(r.logEntries) - 1
 
 	// start ticker goroutine to start elections
 	go r.ticker()
